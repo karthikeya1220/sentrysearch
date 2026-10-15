@@ -60,6 +60,98 @@ def _fmt_time(seconds: float) -> str:
     return f"{m:02d}:{s:02d}"
 
 
+# README "Cost" section: Gemini bills 1 frame per second of uploaded video
+# at $0.00079 per frame, so an hour of footage costs ~$2.84.
+_GEMINI_COST_PER_FRAME = 0.00079
+
+
+def _fmt_cost(cost: float) -> str:
+    """Format a dollar estimate with cents precision.
+
+    Sub-cent estimates keep four decimals so a positive upper bound is
+    never rounded down to "$0.00".
+    """
+    if 0 < cost < 0.01:
+        return f"${cost:.4f}"
+    return f"${cost:.2f}"
+
+
+def _dry_run_index(
+    directory: str,
+    *,
+    backend: str,
+    chunk_duration: int,
+    overlap: int,
+) -> None:
+    """Preview chunk counts and cost for DIRECTORY without indexing.
+
+    Reuses the existing discovery and chunk-span math, so nothing is
+    split, embedded, or written. Only the Gemini backend gets a dollar
+    estimate — local runtimes and Qwen Cloud token billing can't be
+    estimated from footage duration alone.
+    """
+    from .chunker import (
+        SUPPORTED_VIDEO_EXTENSIONS,
+        _get_video_duration,
+        expected_chunk_spans,
+        is_tesla_encrypted,
+        probe_error,
+        scan_directory,
+    )
+
+    if os.path.isfile(directory):
+        videos = [os.path.abspath(directory)]
+    else:
+        videos = scan_directory(directory)
+
+    if not videos:
+        supported = ", ".join(SUPPORTED_VIDEO_EXTENSIONS)
+        click.echo(f"No supported video files found ({supported}).")
+        return
+
+    rows: list[tuple[str, int, float]] = []
+    for video_path in videos:
+        abs_path = os.path.abspath(video_path)
+        basename = os.path.basename(video_path)
+        try:
+            duration = _get_video_duration(abs_path)
+        except Exception:
+            if is_tesla_encrypted(abs_path):
+                click.secho(f"{basename}  (Tesla-encrypted clip)", fg="yellow")
+            else:
+                reason = probe_error(abs_path)
+                click.secho(f"{basename}  (unreadable: {reason})", fg="yellow")
+            continue
+        spans = expected_chunk_spans(
+            duration, chunk_duration=chunk_duration, overlap=overlap,
+        )
+        rows.append((basename, len(spans), duration))
+
+    name_width = max((len(name) for name, _, _ in rows), default=0)
+    for name, n_chunks, duration in rows:
+        click.echo(
+            f"{name:<{name_width}}   {n_chunks} chunks ({round(duration)}s)"
+        )
+    click.echo("---")
+    total_chunks = sum(n for _, n, _ in rows)
+    total_seconds = sum(duration for _, _, duration in rows)
+    click.echo(
+        f"{total_chunks} chunks total, ~{round(total_seconds)}s of footage"
+    )
+    if backend == "gemini":
+        # Cost follows the README formula: footage seconds at 1 billed
+        # frame/sec. Use footage duration, not the sum of overlapping
+        # chunk spans, so overlap doesn't inflate the estimate.
+        cost = total_seconds * _GEMINI_COST_PER_FRAME
+        click.echo(
+            f"Estimated Gemini cost (upper bound): ~{_fmt_cost(cost)}"
+        )
+        click.echo(
+            "Note: still-frame skipping is on by default — real cost will be lower for\n"
+            "parked/Sentry footage. Pass --no-skip-still to bill every frame."
+        )
+
+
 def _cache_last_clip(path: str) -> None:
     """Record path as the most-recent clip for cross-tool integration.
 
@@ -466,6 +558,9 @@ def init():
               help="Enable/disable 4-bit quantization for local backend (default: auto-detect).")
 @click.option("--retry-failed", is_flag=True,
               help="Retry chunks that previously failed and were routed to the DLQ.")
+@click.option("--dry-run", is_flag=True,
+              help="Preview per-file chunk counts and estimated Gemini cost "
+                   "without calling any API, loading a model, or writing files.")
 @click.option("--verbose", is_flag=True, help="Show debug info.")
 @click.option("--rpm", default=None, type=click.IntRange(min=1),
               help="Max requests/minute to the cloud API (gemini, litellm, qwen-cloud). "
@@ -473,7 +568,7 @@ def init():
                    "Overrides GEMINI_RPM / DASHSCOPE_RPM. Ignored by --backend local.")
 def index(directory, chunk_duration, overlap, preprocess, target_resolution,
           target_fps, skip_still, backend, model, dashscope_model, quantize,
-          retry_failed, verbose, rpm):
+          retry_failed, dry_run, verbose, rpm):
     """Index supported video files in DIRECTORY for searching."""
     from .chunker import (
         SUPPORTED_VIDEO_EXTENSIONS,
@@ -506,6 +601,16 @@ def index(directory, chunk_duration, overlap, preprocess, target_resolution,
             backend = "qwen-cloud"
         if backend is None:
             backend = "gemini"
+
+        if dry_run:
+            # Exit before model resolution, embedder construction, store
+            # initialization, and chunk splitting — a preview must not
+            # touch an API, a model, or the filesystem.
+            _dry_run_index(
+                directory, backend=backend,
+                chunk_duration=chunk_duration, overlap=overlap,
+            )
+            return
 
         if backend == "qwen-cloud":
             model = dashscope_model or default_dashscope_embedding_model()

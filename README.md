@@ -133,6 +133,7 @@ Options:
 - `--rpm 10` — cap requests per minute to the cloud API ([details below](#rate-limiting-free-tier-keys))
 - `--backend local` — use a local model instead of Gemini ([details below](#local-backend-no-api-key-needed))
 - `--backend mlx` — use the local model through MLX on Apple Silicon, faster and lighter than `local` ([details below](#mlx-backend-apple-silicon))
+- `--dry-run` — preview per-file chunk counts and estimated Gemini cost without any API calls, model loading, or file writes
 
 ### Search
 

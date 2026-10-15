@@ -456,6 +456,293 @@ class TestIndexCommand:
         assert "overlap" in result.output.lower()
 
 
+class TestIndexDryRun:
+    """`index --dry-run` previews chunks and cost without any indexing work."""
+
+    def _invoke(self, runner, directory, durations, *extra):
+        """Run index --dry-run with duration probes mocked and every
+        indexing side effect wired to a mock we can assert against."""
+        def fake_duration(path):
+            return durations[os.path.basename(path)]
+
+        with patch("sentrysearch.chunker._get_video_duration",
+                   side_effect=fake_duration), \
+             patch("sentrysearch.embedder.get_embedder") as mock_get, \
+             patch("sentrysearch.store.SentryStore") as mock_store, \
+             patch("sentrysearch.dlq.DeadLetterQueue") as mock_dlq, \
+             patch("sentrysearch.chunker.chunk_video") as mock_chunk_video, \
+             patch("sentrysearch.chunker.is_still_frame_chunk") as mock_still, \
+             patch("sentrysearch.local_embedder.detect_default_model") as mock_detect:
+            result = runner.invoke(
+                cli, ["index", str(directory), "--dry-run", *extra],
+            )
+        return result, {
+            "get_embedder": mock_get,
+            "store": mock_store,
+            "dlq": mock_dlq,
+            "chunk_video": mock_chunk_video,
+            "still": mock_still,
+            "detect_default_model": mock_detect,
+        }
+
+    def _two_video_dir(self, tmp_path):
+        d = tmp_path / "vids"
+        d.mkdir()
+        # Names from the issue's example output.
+        (d / "front_2024-01-15_14-30.mp4").write_bytes(b"fake")
+        (d / "left_2024-01-15_14-30.mp4").write_bytes(b"fake")
+        return d
+
+    @staticmethod
+    def _normalized_lines(output):
+        return [" ".join(line.split()) for line in output.splitlines()]
+
+    def test_dry_run_shows_per_file_chunks_and_totals(self, runner, tmp_path):
+        d = self._two_video_dir(tmp_path)
+        # 120s at the default 30s/5s settings -> 5 spans per file.
+        result, _ = self._invoke(
+            runner, d,
+            {"front_2024-01-15_14-30.mp4": 120.0, "left_2024-01-15_14-30.mp4": 120.0},
+        )
+        assert result.exit_code == 0, result.output
+        lines = self._normalized_lines(result.output)
+        assert "front_2024-01-15_14-30.mp4 5 chunks (120s)" in lines
+        assert "left_2024-01-15_14-30.mp4 5 chunks (120s)" in lines
+        assert "10 chunks total, ~240s of footage" in result.output
+
+    def test_dry_run_gemini_estimate_matches_readme_rate(self, runner, tmp_path):
+        """Issue sanity check: 240s of footage ~= $0.19 (240 * $0.00079)."""
+        d = self._two_video_dir(tmp_path)
+        result, _ = self._invoke(
+            runner, d,
+            {"front_2024-01-15_14-30.mp4": 120.0, "left_2024-01-15_14-30.mp4": 120.0},
+        )
+        assert result.exit_code == 0, result.output
+        assert "Estimated Gemini cost (upper bound): ~$0.19" in result.output
+
+    def test_dry_run_gemini_cost_labels_upper_bound_and_notes_skip(
+        self, runner, tmp_path,
+    ):
+        d = tmp_path / "vids"
+        d.mkdir()
+        (d / "clip.mp4").write_bytes(b"fake")
+        result, _ = self._invoke(runner, d, {"clip.mp4": 60.0})
+        assert result.exit_code == 0, result.output
+        assert "upper bound" in result.output
+        assert "still-frame skipping is on by default" in result.output
+        assert "--no-skip-still" in result.output
+
+    def test_dry_run_cost_uses_footage_not_overlapping_chunk_sum(
+        self, runner, tmp_path,
+    ):
+        """120s at 30s/5s makes 5 chunks summing to 140s of spans; the
+        README formula bills footage seconds, so overlap must not inflate
+        the estimate ($0.09, not $0.11)."""
+        d = tmp_path / "vids"
+        d.mkdir()
+        (d / "clip.mp4").write_bytes(b"fake")
+        result, _ = self._invoke(runner, d, {"clip.mp4": 120.0})
+        assert result.exit_code == 0, result.output
+        assert "5 chunks total, ~120s of footage" in result.output
+        assert "~$0.09" in result.output
+        assert "~$0.11" not in result.output
+
+    def test_dry_run_sub_cent_estimate_is_not_zero(self, runner, tmp_path):
+        d = tmp_path / "vids"
+        d.mkdir()
+        (d / "clip.mp4").write_bytes(b"fake")
+        result, _ = self._invoke(runner, d, {"clip.mp4": 3.0})
+        assert result.exit_code == 0, result.output
+        assert "1 chunks (3s)" in result.output
+        # 3 * 0.00079 = 0.00237 — a positive bound must not print as $0.00
+        assert "~$0.0024" in result.output
+
+    def test_dry_run_respects_chunk_duration_and_overlap_flags(
+        self, runner, tmp_path,
+    ):
+        d = tmp_path / "vids"
+        d.mkdir()
+        (d / "clip.mp4").write_bytes(b"fake")
+        result, _ = self._invoke(
+            runner, d, {"clip.mp4": 120.0},
+            "--chunk-duration", "60", "--overlap", "0",
+        )
+        assert result.exit_code == 0, result.output
+        assert "2 chunks (120s)" in result.output
+        assert "2 chunks total" in result.output
+
+    def test_dry_run_empty_directory(self, runner, tmp_path):
+        empty_dir = tmp_path / "empty"
+        empty_dir.mkdir()
+        result, mocks = self._invoke(runner, empty_dir, {})
+        assert result.exit_code == 0, result.output
+        assert "No supported video files found" in result.output
+        for mock in mocks.values():
+            mock.assert_not_called()
+
+    def test_dry_run_ignores_unsupported_files(self, runner, tmp_path):
+        d = tmp_path / "vids"
+        d.mkdir()
+        (d / "notes.txt").write_text("not a video")
+        result, _ = self._invoke(runner, d, {})
+        assert result.exit_code == 0, result.output
+        assert "No supported video files found" in result.output
+
+    def test_dry_run_accepts_a_single_file(self, runner, tmp_path):
+        d = tmp_path / "vids"
+        d.mkdir()
+        clip = d / "clip.mp4"
+        clip.write_bytes(b"fake")
+        result, _ = self._invoke(runner, clip, {"clip.mp4": 60.0})
+        assert result.exit_code == 0, result.output
+        lines = self._normalized_lines(result.output)
+        assert "clip.mp4 3 chunks (60s)" in lines
+        assert "3 chunks total, ~60s of footage" in result.output
+
+    def test_dry_run_local_backend_shows_no_dollar_estimate(
+        self, runner, tmp_path,
+    ):
+        d = tmp_path / "vids"
+        d.mkdir()
+        (d / "clip.mp4").write_bytes(b"fake")
+        result, _ = self._invoke(
+            runner, d, {"clip.mp4": 120.0}, "--backend", "local", "--model", "qwen2b",
+        )
+        assert result.exit_code == 0, result.output
+        assert "5 chunks total, ~120s of footage" in result.output
+        assert "$" not in result.output
+        assert "Estimated" not in result.output
+
+    def test_dry_run_local_backend_skips_model_autodetect(
+        self, runner, tmp_path,
+    ):
+        """Without --model, a real local index auto-detects a model (which
+        imports torch). Dry-run must not."""
+        d = tmp_path / "vids"
+        d.mkdir()
+        (d / "clip.mp4").write_bytes(b"fake")
+        result, mocks = self._invoke(
+            runner, d, {"clip.mp4": 60.0}, "--backend", "local",
+        )
+        assert result.exit_code == 0, result.output
+        mocks["detect_default_model"].assert_not_called()
+        assert "Auto-detected model" not in result.output
+        assert "$" not in result.output
+
+    def test_dry_run_qwen_cloud_shows_no_dollar_estimate(
+        self, runner, tmp_path,
+    ):
+        d = tmp_path / "vids"
+        d.mkdir()
+        (d / "clip.mp4").write_bytes(b"fake")
+        result, _ = self._invoke(
+            runner, d, {"clip.mp4": 120.0}, "--backend", "qwen-cloud",
+        )
+        assert result.exit_code == 0, result.output
+        assert "5 chunks total, ~120s of footage" in result.output
+        assert "$" not in result.output
+
+    def test_dry_run_mlx_shows_no_dollar_estimate(self, runner, tmp_path):
+        d = tmp_path / "vids"
+        d.mkdir()
+        (d / "clip.mp4").write_bytes(b"fake")
+        result, _ = self._invoke(runner, d, {"clip.mp4": 120.0}, "--backend", "mlx")
+        assert result.exit_code == 0, result.output
+        assert "5 chunks total, ~120s of footage" in result.output
+        assert "$" not in result.output
+
+    def test_dry_run_model_flag_implies_local_backend(self, runner, tmp_path):
+        """--model alone infers the local backend, so no Gemini estimate."""
+        d = tmp_path / "vids"
+        d.mkdir()
+        (d / "clip.mp4").write_bytes(b"fake")
+        result, _ = self._invoke(runner, d, {"clip.mp4": 60.0}, "--model", "qwen2b")
+        assert result.exit_code == 0, result.output
+        assert "3 chunks total, ~60s of footage" in result.output
+        assert "$" not in result.output
+
+    def test_dry_run_skips_unreadable_file(self, runner, tmp_path):
+        d = tmp_path / "vids"
+        d.mkdir()
+        (d / "a_bad.mp4").write_bytes(b"not a video")
+        (d / "b_good.mp4").write_bytes(b"fake")
+
+        def fake_duration(path):
+            if os.path.basename(path).startswith("a_bad"):
+                raise RuntimeError("ffprobe failed")
+            return 60.0
+
+        with patch("sentrysearch.chunker._get_video_duration",
+                   side_effect=fake_duration), \
+             patch("sentrysearch.chunker.probe_error",
+                   return_value="Invalid data found when processing input"), \
+             patch("sentrysearch.embedder.get_embedder") as mock_get:
+            result = runner.invoke(cli, ["index", str(d), "--dry-run"])
+
+        assert result.exit_code == 0, result.output
+        assert "a_bad.mp4  (unreadable: Invalid data found" in result.output
+        assert "3 chunks total, ~60s of footage" in result.output
+        mock_get.assert_not_called()
+
+    def test_dry_run_labels_tesla_encrypted_clip(self, runner, tmp_path):
+        d = tmp_path / "vids"
+        d.mkdir()
+        (d / "encrypted.mp4").write_bytes(b"not a video")
+
+        with patch("sentrysearch.chunker._get_video_duration",
+                   side_effect=RuntimeError("ffprobe failed")), \
+             patch("sentrysearch.chunker.is_tesla_encrypted",
+                   return_value=True):
+            result = runner.invoke(cli, ["index", str(d), "--dry-run"])
+
+        assert result.exit_code == 0, result.output
+        assert "encrypted.mp4  (Tesla-encrypted clip)" in result.output
+
+    def test_dry_run_makes_zero_side_effects(self, runner, tmp_path):
+        """The dry-run path must not construct an embedder, load a model,
+        split files, initialize the index, or write anything."""
+        d = self._two_video_dir(tmp_path)
+        before = sorted(str(p) for p in tmp_path.rglob("*"))
+
+        result, mocks = self._invoke(
+            runner, d,
+            {"front_2024-01-15_14-30.mp4": 120.0, "left_2024-01-15_14-30.mp4": 120.0},
+        )
+
+        assert result.exit_code == 0, result.output
+        after = sorted(str(p) for p in tmp_path.rglob("*"))
+        assert before == after
+        mocks["get_embedder"].assert_not_called()
+        mocks["store"].assert_not_called()
+        mocks["dlq"].assert_not_called()
+        mocks["chunk_video"].assert_not_called()
+        mocks["still"].assert_not_called()
+        mocks["detect_default_model"].assert_not_called()
+
+    def test_dry_run_still_validates_options(self, runner, tmp_path):
+        """Flag validation is unchanged when --dry-run is set."""
+        d = tmp_path / "vids"
+        d.mkdir()
+        (d / "clip.mp4").write_bytes(b"fake")
+        result = runner.invoke(cli, [
+            "index", str(d), "--dry-run",
+            "--chunk-duration", "5", "--overlap", "5",
+        ])
+        assert result.exit_code != 0
+        assert "overlap" in result.output.lower()
+
+        result = runner.invoke(cli, [
+            "index", str(d), "--dry-run",
+            "--model", "qwen2b", "--dashscope-model", "qwen3-vl-embedding",
+        ])
+        assert result.exit_code == 2
+
+    def test_index_help_documents_dry_run(self, runner):
+        result = runner.invoke(cli, ["index", "--help"])
+        assert result.exit_code == 0
+        assert "--dry-run" in result.output
+
+
 class TestShellCommand:
     @pytest.fixture(autouse=True)
     def _isolate_history(self, tmp_path):
