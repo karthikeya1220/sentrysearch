@@ -479,10 +479,11 @@ Both Gemini Embedding 2 and Qwen3-VL-Embedding can natively embed video — raw 
 
 ### Gemini
 
-Indexing 1 hour of footage costs ~$2.84 with Gemini's embedding API (default settings: 30s chunks, 5s overlap):
+Indexing 1 hour of footage costs ~$3.41 with Gemini's embedding API (default settings: 30s chunks, 5s overlap):
 
-> 1 hour = 3,600 seconds of video = 3,600 frames processed by the model.
-> 3,600 frames × $0.00079 = ~$2.84/hr
+> 1 hour = 3,600 seconds of footage, split into 144 overlapping chunks that are each uploaded and billed separately at 1 frame per second.
+> Overlapping seconds are billed once per chunk that contains them: 4,315 billed frames in total.
+> 4,315 frames × $0.00079 = ~$3.41/hr
 
 The Gemini API natively extracts and tokenizes exactly 1 frame per second from uploaded video, regardless of the file's actual frame rate. The preprocessing step (which downscales chunks to 480p at 5fps via ffmpeg) is a local/bandwidth optimization — it keeps payload sizes small so API requests are fast and don't timeout — but does not change the number of frames the API processes.
 

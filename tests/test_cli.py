@@ -511,14 +511,17 @@ class TestIndexDryRun:
         assert "10 chunks total, ~240s of footage" in result.output
 
     def test_dry_run_gemini_estimate_matches_readme_rate(self, runner, tmp_path):
-        """Issue sanity check: 240s of footage ~= $0.19 (240 * $0.00079)."""
+        """Two 120s files = 10 chunks covering 280 billed span-seconds;
+        280 * $0.00079 ~= $0.22 (the issue's $0.19 assumed footage
+        seconds, but overlapping seconds are billed per chunk)."""
         d = self._two_video_dir(tmp_path)
         result, _ = self._invoke(
             runner, d,
             {"front_2024-01-15_14-30.mp4": 120.0, "left_2024-01-15_14-30.mp4": 120.0},
         )
         assert result.exit_code == 0, result.output
-        assert "Estimated Gemini cost (upper bound): ~$0.19" in result.output
+        assert "Estimated Gemini cost (upper bound): ~$0.22" in result.output
+        assert "280 billed chunk-seconds" in result.output
 
     def test_dry_run_gemini_cost_labels_upper_bound_and_notes_skip(
         self, runner, tmp_path,
@@ -532,20 +535,62 @@ class TestIndexDryRun:
         assert "still-frame skipping is on by default" in result.output
         assert "--no-skip-still" in result.output
 
-    def test_dry_run_cost_uses_footage_not_overlapping_chunk_sum(
+    def test_dry_run_cost_bills_overlapping_chunk_spans(
         self, runner, tmp_path,
     ):
-        """120s at 30s/5s makes 5 chunks summing to 140s of spans; the
-        README formula bills footage seconds, so overlap must not inflate
-        the estimate ($0.09, not $0.11)."""
+        """Each chunk is uploaded and billed separately, so the estimate
+        covers the sum of the chunk spans: 120s at 30s/5s makes 5 chunks
+        covering 140 billed seconds -> ~$0.11 (140 * $0.00079), not the
+        footage-based ~$0.09."""
         d = tmp_path / "vids"
         d.mkdir()
         (d / "clip.mp4").write_bytes(b"fake")
         result, _ = self._invoke(runner, d, {"clip.mp4": 120.0})
         assert result.exit_code == 0, result.output
         assert "5 chunks total, ~120s of footage" in result.output
-        assert "~$0.09" in result.output
-        assert "~$0.11" not in result.output
+        assert "140 billed chunk-seconds" in result.output
+        assert "~$0.11" in result.output
+        assert "~$0.09" not in result.output
+
+    def test_dry_run_no_skip_still_hides_still_frame_note(
+        self, runner, tmp_path,
+    ):
+        """With --no-skip-still, still-frame skipping is off, so the dry
+        run must not describe it as enabled or advise disabling it."""
+        d = tmp_path / "vids"
+        d.mkdir()
+        (d / "clip.mp4").write_bytes(b"fake")
+        result, _ = self._invoke(runner, d, {"clip.mp4": 120.0}, "--no-skip-still")
+        assert result.exit_code == 0, result.output
+        assert "still-frame skipping" not in result.output
+        assert "--no-skip-still" not in result.output
+        assert "Estimated Gemini cost (upper bound): ~$0.11" in result.output
+
+    def test_dry_run_notes_already_indexed_files_counted_fully(
+        self, runner, tmp_path,
+    ):
+        """Already-indexed files are charged at full cost (no store
+        lookup), so the output must say a real run may skip them."""
+        d = self._two_video_dir(tmp_path)
+        result, _ = self._invoke(
+            runner, d,
+            {"front_2024-01-15_14-30.mp4": 120.0, "left_2024-01-15_14-30.mp4": 120.0},
+        )
+        assert result.exit_code == 0, result.output
+        assert "already-indexed files are included in this estimate" in result.output
+        assert "a real indexing run may skip them" in result.output
+
+    def test_dry_run_pluralizes_chunk_counts(self, runner, tmp_path):
+        """A single chunk must print "1 chunk", never "1 chunks"."""
+        d = tmp_path / "vids"
+        d.mkdir()
+        (d / "clip.mp4").write_bytes(b"fake")
+        result, _ = self._invoke(runner, d, {"clip.mp4": 3.0})
+        assert result.exit_code == 0, result.output
+        lines = self._normalized_lines(result.output)
+        assert "clip.mp4 1 chunk (3s)" in lines
+        assert "1 chunk total, ~3s of footage" in result.output
+        assert "1 chunks" not in result.output
 
     def test_dry_run_sub_cent_estimate_is_not_zero(self, runner, tmp_path):
         d = tmp_path / "vids"
@@ -553,7 +598,7 @@ class TestIndexDryRun:
         (d / "clip.mp4").write_bytes(b"fake")
         result, _ = self._invoke(runner, d, {"clip.mp4": 3.0})
         assert result.exit_code == 0, result.output
-        assert "1 chunks (3s)" in result.output
+        assert "1 chunk (3s)" in result.output
         # 3 * 0.00079 = 0.00237 — a positive bound must not print as $0.00
         assert "~$0.0024" in result.output
 

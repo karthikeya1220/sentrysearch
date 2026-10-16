@@ -60,8 +60,10 @@ def _fmt_time(seconds: float) -> str:
     return f"{m:02d}:{s:02d}"
 
 
-# README "Cost" section: Gemini bills 1 frame per second of uploaded video
-# at $0.00079 per frame, so an hour of footage costs ~$2.84.
+# README "Cost" section: Gemini bills 1 frame per second of each uploaded
+# chunk at $0.00079 per frame. Chunks are uploaded separately and overlap,
+# so billed seconds exceed footage duration (~$3.41 for an hour at the
+# default 30s/5s settings).
 _GEMINI_COST_PER_FRAME = 0.00079
 
 
@@ -76,19 +78,25 @@ def _fmt_cost(cost: float) -> str:
     return f"${cost:.2f}"
 
 
+def _chunks_label(n_chunks: int) -> str:
+    """Pluralize chunk counts: "1 chunk" but "5 chunks"."""
+    return "1 chunk" if n_chunks == 1 else f"{n_chunks} chunks"
+
+
 def _dry_run_index(
     directory: str,
     *,
     backend: str,
     chunk_duration: int,
     overlap: int,
+    skip_still: bool,
 ) -> None:
     """Preview chunk counts and cost for DIRECTORY without indexing.
 
     Reuses the existing discovery and chunk-span math, so nothing is
     split, embedded, or written. Only the Gemini backend gets a dollar
     estimate — local runtimes and Qwen Cloud token billing can't be
-    estimated from footage duration alone.
+    estimated from chunk spans alone.
     """
     from .chunker import (
         SUPPORTED_VIDEO_EXTENSIONS,
@@ -109,7 +117,8 @@ def _dry_run_index(
         click.echo(f"No supported video files found ({supported}).")
         return
 
-    rows: list[tuple[str, int, float]] = []
+    # Rows: (name, chunk count, footage seconds, billed chunk-seconds).
+    rows: list[tuple[str, int, float, float]] = []
     for video_path in videos:
         abs_path = os.path.abspath(video_path)
         basename = os.path.basename(video_path)
@@ -125,30 +134,38 @@ def _dry_run_index(
         spans = expected_chunk_spans(
             duration, chunk_duration=chunk_duration, overlap=overlap,
         )
-        rows.append((basename, len(spans), duration))
+        billed_seconds = sum(end - start for start, end in spans)
+        rows.append((basename, len(spans), duration, billed_seconds))
 
-    name_width = max((len(name) for name, _, _ in rows), default=0)
-    for name, n_chunks, duration in rows:
+    name_width = max((len(name) for name, _, _, _ in rows), default=0)
+    for name, n_chunks, duration, _ in rows:
         click.echo(
-            f"{name:<{name_width}}   {n_chunks} chunks ({round(duration)}s)"
+            f"{name:<{name_width}}   {_chunks_label(n_chunks)} ({round(duration)}s)"
         )
     click.echo("---")
-    total_chunks = sum(n for _, n, _ in rows)
-    total_seconds = sum(duration for _, _, duration in rows)
+    total_chunks = sum(n for _, n, _, _ in rows)
+    total_seconds = sum(duration for _, _, duration, _ in rows)
     click.echo(
-        f"{total_chunks} chunks total, ~{round(total_seconds)}s of footage"
+        f"{_chunks_label(total_chunks)} total, ~{round(total_seconds)}s of footage"
     )
     if backend == "gemini":
-        # Cost follows the README formula: footage seconds at 1 billed
-        # frame/sec. Use footage duration, not the sum of overlapping
-        # chunk spans, so overlap doesn't inflate the estimate.
-        cost = total_seconds * _GEMINI_COST_PER_FRAME
+        # Every chunk is uploaded (and billed) separately at 1 frame/sec,
+        # so the estimate covers the sum of the chunk spans — overlapping
+        # seconds are billed once per chunk that contains them.
+        total_billed = sum(billed for _, _, _, billed in rows)
+        cost = total_billed * _GEMINI_COST_PER_FRAME
         click.echo(
-            f"Estimated Gemini cost (upper bound): ~{_fmt_cost(cost)}"
+            f"Estimated Gemini cost (upper bound): ~{_fmt_cost(cost)} "
+            f"({round(total_billed)} billed chunk-seconds)"
         )
+        if skip_still:
+            click.echo(
+                "Note: still-frame skipping is on by default — real cost will be lower for\n"
+                "parked/Sentry footage. Pass --no-skip-still to bill every frame."
+            )
         click.echo(
-            "Note: still-frame skipping is on by default — real cost will be lower for\n"
-            "parked/Sentry footage. Pass --no-skip-still to bill every frame."
+            "Note: already-indexed files are included in this estimate at full cost —\n"
+            "a real indexing run may skip them."
         )
 
 
@@ -609,6 +626,7 @@ def index(directory, chunk_duration, overlap, preprocess, target_resolution,
             _dry_run_index(
                 directory, backend=backend,
                 chunk_duration=chunk_duration, overlap=overlap,
+                skip_still=skip_still,
             )
             return
 
