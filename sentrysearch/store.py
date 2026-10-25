@@ -240,7 +240,7 @@ class SentryStore:
         self._model = model
         # Separate collection per backend+model so incompatible vectors never mix.
         # collection_name overrides the derived name for throwaway collections
-        # (e.g. scripts/accuracy_eval.py's accuracy_eval); pass a valid ChromaDB
+        # (e.g. benchmarks/accuracy_eval.py's accuracy_eval); pass a valid ChromaDB
         # name ([a-zA-Z0-9._-]) — it is used verbatim.
         col_name = collection_name or _collection_name(backend, model)
         metadata = {"hnsw:space": "cosine", "embedding_backend": backend}

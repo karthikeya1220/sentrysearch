@@ -1117,6 +1117,50 @@ class TestIndexLocalFlags:
             # Should have inferred backend="local" from --model
             mock_get.assert_called_once_with("local", model="qwen2b", quantize=None, rpm=None)
 
+    def test_index_resolves_flags_via_shared_helpers(self, runner, tmp_path,
+                                                     monkeypatch):
+        """The CLI delegates flag resolution to sentrysearch.embedder so the
+        accuracy evaluation resolves the same flags the same way (issue #78).
+        """
+        import sentrysearch.embedder as embedder_mod
+
+        empty_dir = tmp_path / "empty"
+        empty_dir.mkdir()
+        backend_spy = MagicMock(side_effect=embedder_mod.resolve_backend)
+        model_spy = MagicMock(side_effect=embedder_mod.resolve_model)
+        monkeypatch.setattr(embedder_mod, "resolve_backend", backend_spy)
+        monkeypatch.setattr(embedder_mod, "resolve_model", model_spy)
+
+        with patch("sentrysearch.store.SentryStore") as MockStore, \
+             patch("sentrysearch.embedder.get_embedder", return_value=MagicMock()):
+            MockStore.return_value = MagicMock()
+            result = runner.invoke(cli, [
+                "index", str(empty_dir), "--model", "qwen2b",
+            ])
+
+        assert result.exit_code == 0, result.output
+        backend_spy.assert_called_once_with(None, "qwen2b", None)
+        args, kwargs = model_spy.call_args
+        assert args == ("local", "qwen2b", None)
+        assert callable(kwargs["echo"])
+
+    def test_index_qwen_cloud_honors_model_flag(self, runner, tmp_path):
+        """qwen-cloud falls back to --model when --dashscope-model is absent
+        (shared resolver behavior, issue #78)."""
+        empty_dir = tmp_path / "empty"
+        empty_dir.mkdir()
+        with patch("sentrysearch.store.SentryStore") as MockStore, \
+             patch("sentrysearch.embedder.get_embedder", return_value=MagicMock()) as mock_get:
+            MockStore.return_value = MagicMock()
+            result = runner.invoke(cli, [
+                "index", str(empty_dir), "--backend", "qwen-cloud",
+                "--model", "my-proxy-model",
+            ])
+        assert result.exit_code == 0, result.output
+        mock_get.assert_called_once_with(
+            "qwen-cloud", model="my-proxy-model", quantize=None, rpm=None,
+        )
+
     def test_index_passes_backend_and_model_to_store(self, runner, tmp_path):
         d = tmp_path / "vids"
         d.mkdir()

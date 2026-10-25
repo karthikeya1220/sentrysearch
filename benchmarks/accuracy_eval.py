@@ -26,8 +26,8 @@ Workflow:
 
 Usage (from the repo root, with the desired backend extras installed):
 
-    uv run python scripts/accuracy_eval.py --backend local --model qwen8b
-    uv run python scripts/accuracy_eval.py --backend gemini
+    uv run python benchmarks/accuracy_eval.py --backend local --model qwen8b
+    uv run python benchmarks/accuracy_eval.py --backend gemini
 
 Not a user-facing CLI command — see CONTRIBUTING.md; this is a dev tool.
 Judgments accumulate in tests/data/accuracy_judgments.json and are meant to
@@ -48,14 +48,27 @@ import urllib.request
 from pathlib import Path
 
 from sentrysearch.chunker import chunk_video, preprocess_chunk
-from sentrysearch.embedder import get_embedder, reset_embedder
+from sentrysearch.embedder import (
+    DashScopeAPIKeyError,
+    DashScopeDependencyError,
+    GeminiAPIKeyError,
+    GeminiQuotaError,
+    embed_with_retry,
+    get_embedder,
+    reset_embedder,
+    resolve_backend,
+    resolve_model,
+)
+from sentrysearch.litellm_embedder import LiteLLMConfigError, LiteLLMQuotaError
+from sentrysearch.local_embedder import LocalModelError
+from sentrysearch.mlx_embedder import MLXModelError
 from sentrysearch.search import search_footage
 from sentrysearch.store import DEFAULT_DB_PATH, SentryStore
 
 # --------------------------------------------------------------------------
 # Fixed workload — identical to issue #68's query list and benchmark clip.
-# Keep the two in sync: #68's script should import from here rather than
-# redefine the list.
+# Keep the two in sync: #68 imports it from benchmarks.accuracy_eval rather
+# than redefining it (see the import documented in benchmarks/__init__.py).
 # --------------------------------------------------------------------------
 
 BENCHMARK_CLIP_URL = (
@@ -111,6 +124,12 @@ DEFAULT_JUDGMENTS_PATH = (
 
 _TIME_WINDOW_DECIMALS = 1
 
+# Retries for a transient embed failure while indexing (2 s, then 4 s) — the
+# same policy as `sentrysearch index`, except that exhausted retries abort
+# the run instead of being skipped: a silently dropped chunk would skew the
+# scores.
+_MAX_EMBED_ATTEMPTS = 3
+
 # Reserved top-level key in the judgment cache: records which clip the
 # verdicts were made against (issue #78 B1). Queries never collide with it
 # because the workload is fixed and human-written.
@@ -141,11 +160,12 @@ def judgment_key(start_time: float, end_time: float) -> str:
     return f"{start}-{end}"
 
 
-def file_sha256(path: str | Path, *, chunk_size: int = 1 << 20) -> str:
+def file_sha256(path: str | Path) -> str:
     """Hex SHA-256 of *path*'s contents (content identity of a clip)."""
     digest = hashlib.sha256()
     with open(path, "rb") as fh:
-        for block in iter(lambda: fh.read(chunk_size), b""):
+        # 1 MiB blocks: the benchmark clip is ~140 MB.
+        for block in iter(lambda: fh.read(1 << 20), b""):
             digest.update(block)
     return digest.hexdigest()
 
@@ -158,9 +178,7 @@ def clip_identity(
 
 
 def _format_identity(identity: dict) -> str:
-    parts = [f"{field}={identity[field]}" for field in _IDENTITY_FIELDS
-             if field in identity]
-    return " ".join(parts) or "(none)"
+    return " ".join(f"{field}={identity[field]}" for field in _IDENTITY_FIELDS)
 
 
 def _read_meta(path: Path) -> dict | None:
@@ -183,37 +201,36 @@ def _verify_clip_identity(
 
     An empty cache protects nothing, so it is always adopted (and stamped
     with the current identity on first save). Anything already judged must
-    either carry a matching identity or be rejected with an actionable error:
-    verdicts from an unverified clip would silently poison the evaluation.
+    carry both identity fields, and both must equal the clip being
+    evaluated: verdicts from an unverified clip would silently poison the
+    evaluation.
     """
     verdict_count = sum(len(verdicts) for verdicts in judgments.values())
     if verdict_count == 0:
         return
-    recorded: dict = {}
-    if isinstance(meta, dict):
-        recorded = {field: meta[field] for field in _IDENTITY_FIELDS
-                    if field in meta}
-    if not recorded:
+    recorded = meta if isinstance(meta, dict) else {}
+    missing = [field for field in _IDENTITY_FIELDS if field not in recorded]
+    if missing:
         expected_text = ", ".join(f"{k}={v}" for k, v in expected.items())
         raise AccuracyEvalError(
             f"Judgment cache {path} holds {verdict_count} verdict(s) but no "
-            f"clip identity (no {_META_KEY!r} entry), so it cannot be verified "
-            f"against the clip being evaluated ({expected_text}). Judgments "
+            f"clip identity ({', '.join(missing)} missing from the "
+            f"{_META_KEY!r} entry), so it cannot be verified against the clip "
+            f"being evaluated ({expected_text}). Judgments "
             "from an unverified clip are never reused. Either delete the cache "
             "to start fresh, or record the current clip's identity at the "
             f"file's top level:\n  {json.dumps({_META_KEY: expected})}"
         )
-    for field, value in recorded.items():
-        if field in expected and expected[field] != value:
-            raise AccuracyEvalError(
-                f"Judgment cache {path} was judged against a different clip "
-                "than the one being evaluated.\n"
-                f"  cache: {_format_identity(recorded)}\n"
-                f"  clip:  {_format_identity(expected)}\n"
-                "Reusing those judgments would corrupt the evaluation. Point "
-                "--clip at the judged clip, or move/delete the cache file to "
-                "start fresh."
-            )
+    if any(recorded[field] != expected[field] for field in _IDENTITY_FIELDS):
+        raise AccuracyEvalError(
+            f"Judgment cache {path} was judged against a different clip "
+            "than the one being evaluated.\n"
+            f"  cache: {_format_identity(recorded)}\n"
+            f"  clip:  {_format_identity(expected)}\n"
+            "Reusing those judgments would corrupt the evaluation. Point "
+            "--clip at the judged clip, or move/delete the cache file to "
+            "start fresh."
+        )
 
 
 def load_judgments(
@@ -626,6 +643,9 @@ def index_clip(
     Uses the default chunking settings (30 s chunks, 5 s overlap) and
     preprocessing, matching `sentrysearch index`. Every chunk is embedded
     (no still-frame skipping) so the eval covers the full clip.
+
+    Transient embed failures are retried with backoff; one that survives
+    them raises, so a partial index can never be scored quietly.
     Returns the number of chunks stored.
     """
     chunks = chunk_video(str(clip_path))
@@ -638,7 +658,17 @@ def index_clip(
                 file=err,
             )
             embed_path = preprocess_chunk(chunk["chunk_path"])
-            embedding = embedder.embed_video_chunk(embed_path, verbose=verbose)
+            embedding = embed_with_retry(
+                embedder,
+                embed_path,
+                verbose=verbose,
+                max_attempts=_MAX_EMBED_ATTEMPTS,
+                on_retry=lambda attempt, exc, wait: print(
+                    f"  Embed error (attempt {attempt}/{_MAX_EMBED_ATTEMPTS}), "
+                    f"retrying in {wait}s: {exc}",
+                    file=err,
+                ),
+            )
             store.add_chunk(
                 store.make_chunk_id(chunk["source_file"], chunk["start_time"]),
                 embedding,
@@ -734,41 +764,6 @@ def format_report(
     return "\n".join(lines)
 
 
-def _resolve_backend_model(
-    backend: str | None, model: str | None,
-) -> tuple[str, str | None]:
-    """Mirror `sentrysearch index`'s backend/model resolution."""
-    if model is not None and backend is None:
-        backend = "local"
-    if backend is None:
-        backend = "gemini"
-
-    if backend == "local":
-        from sentrysearch.local_embedder import (
-            detect_default_model,
-            normalize_model_key,
-        )
-
-        model = normalize_model_key(model or detect_default_model())
-    elif backend == "mlx":
-        from sentrysearch.mlx_embedder import resolve_model_ref
-
-        model = resolve_model_ref(model)
-    elif backend == "qwen-cloud":
-        from sentrysearch.qwen_cloud_embedder import (
-            default_dashscope_embedding_model,
-        )
-
-        model = model or default_dashscope_embedding_model()
-    elif backend == "litellm":
-        from sentrysearch.litellm_embedder import default_litellm_model
-
-        model = model or default_litellm_model()
-    else:  # gemini
-        model = None
-    return backend, model
-
-
 def run_evaluation(
     *,
     backend: str | None = None,
@@ -792,7 +787,10 @@ def run_evaluation(
     comparison table.
     """
     workload = list(WORKLOAD if workload is None else workload)
-    backend, model = _resolve_backend_model(backend, model)
+    # Same flag resolution as `sentrysearch index`, so both entry points
+    # agree on which backend/model a given --backend/--model pair selects.
+    backend = resolve_backend(backend, model)
+    model = resolve_model(backend, model)
 
     if not workload:
         print("Workload is empty — nothing to evaluate.", file=err)
@@ -884,6 +882,15 @@ def main(argv: list[str] | None = None) -> int:
             verbose=args.verbose,
         )
     except AccuracyEvalError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    except (GeminiAPIKeyError, GeminiQuotaError,
+            LiteLLMConfigError, LiteLLMQuotaError,
+            DashScopeAPIKeyError, DashScopeDependencyError,
+            LocalModelError, MLXModelError) as exc:
+        # Backend setup failures — a missing optional extra, a missing key,
+        # exhausted quota — are user-facing, not bugs: report them the way
+        # `sentrysearch index` does instead of dumping a traceback.
         print(f"Error: {exc}", file=sys.stderr)
         return 1
     except EOFError:

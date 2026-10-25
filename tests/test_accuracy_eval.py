@@ -1,4 +1,4 @@
-"""Offline tests for scripts/accuracy_eval.py (issue #78).
+"""Offline tests for benchmarks/accuracy_eval.py (issue #78).
 
 No model downloads, live API calls, or destructive database access: the
 script is loaded by path, and the embedding/search steps are monkeypatched.
@@ -15,18 +15,19 @@ import math
 import os
 import shlex
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
 
 _SCRIPT_PATH = (
-    Path(__file__).resolve().parents[1] / "scripts" / "accuracy_eval.py"
+    Path(__file__).resolve().parents[1] / "benchmarks" / "accuracy_eval.py"
 )
 
 
 @pytest.fixture(scope="module")
 def ae():
-    """Load scripts/accuracy_eval.py as a module (scripts/ is not a package)."""
+    """Load benchmarks/accuracy_eval.py as a module (by path, not import)."""
     spec = importlib.util.spec_from_file_location("accuracy_eval", _SCRIPT_PATH)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -200,6 +201,24 @@ class TestClipIdentity:
         # actionable: shows exactly what to add to keep the judgments
         assert '"_meta"' in message
         assert identity["clip_sha256"] in message
+
+    def test_partial_identity_rejected(self, ae, tmp_path):
+        # One of the two identity fields cannot bind the cache to the clip.
+        path = tmp_path / "j.json"
+        path.write_text(
+            json.dumps({
+                ae._META_KEY: {"clip_url": ae.BENCHMARK_CLIP_URL},
+                "q": {"0.0-30.0": True},
+            }),
+            encoding="utf-8",
+        )
+        identity = {
+            "clip_url": ae.BENCHMARK_CLIP_URL,
+            "clip_sha256": "0" * 64,
+        }
+        with pytest.raises(ae.AccuracyEvalError, match="no clip identity") as exc:
+            ae.load_judgments(path, clip_identity=identity)
+        assert "clip_sha256 missing" in str(exc.value)
 
     def test_legacy_empty_cache_adopted(self, ae, tmp_path):
         path = tmp_path / "j.json"
@@ -837,17 +856,67 @@ class TestRunEvaluation:
 
 
 class TestBackendModelResolution:
-    def test_gemini_has_no_model(self, ae):
-        assert ae._resolve_backend_model("gemini", None) == ("gemini", None)
+    """Flag resolution is delegated to the shared helpers in
+    sentrysearch.embedder, so the eval and `sentrysearch index` agree on
+    which backend/model a given flag pair selects (issue #78).
+    """
+
+    def test_resolves_before_the_empty_workload_gate(self, ae, monkeypatch):
+        # Resolution runs before the empty-workload early return, so an empty
+        # workload proves the wiring without touching disk or the network.
+        seen = {}
+
+        def fake_resolve_backend(backend=None, model=None):
+            seen["backend"] = (backend, model)
+            return "local"
+
+        def fake_resolve_model(backend, model=None, **_kwargs):
+            seen["model"] = (backend, model)
+            return "qwen2b"
+
+        monkeypatch.setattr(ae, "resolve_backend", fake_resolve_backend)
+        monkeypatch.setattr(ae, "resolve_model", fake_resolve_model)
+
+        assert ae.run_evaluation(workload=[], err=io.StringIO()) is None
+        assert seen == {"backend": (None, None), "model": ("local", None)}
+
+    def test_gemini_is_the_default_and_has_no_model(self, ae):
+        assert ae.resolve_backend() == "gemini"
+        assert ae.resolve_backend("gemini", None) == "gemini"
+        assert ae.resolve_model("gemini", None) is None
 
     def test_model_implies_local(self, ae):
-        assert ae._resolve_backend_model(None, "qwen2b") == ("local", "qwen2b")
+        assert ae.resolve_backend(None, "qwen2b") == "local"
+        assert ae.resolve_model("local", "qwen2b") == "qwen2b"
 
     def test_local_normalizes_hf_id(self, ae):
-        backend, model = ae._resolve_backend_model(
+        assert ae.resolve_model(
             "local", "Qwen/Qwen3-VL-Embedding-2B",
-        )
-        assert (backend, model) == ("local", "qwen2b")
+        ) == "qwen2b"
+
+    def test_dashscope_model_implies_qwen_cloud(self, ae):
+        assert ae.resolve_backend(None, None, "qc-model") == "qwen-cloud"
+
+    def test_qwen_cloud_prefers_the_dashscope_flag(self, ae):
+        assert ae.resolve_model(
+            "qwen-cloud", "ignored", "qc-model",
+        ) == "qc-model"
+
+    def test_litellm_falls_back_to_its_default(self, ae):
+        from sentrysearch.litellm_embedder import default_litellm_model
+
+        assert ae.resolve_model("litellm", None) == default_litellm_model()
+
+    def test_mlx_resolves_the_full_model_reference(self, ae):
+        from sentrysearch.mlx_embedder import resolve_model_ref
+
+        assert ae.resolve_model("mlx", None) == resolve_model_ref(None)
+
+    def test_unknown_backend_is_rejected_by_the_cli(self, ae, capsys):
+        with pytest.raises(SystemExit) as excinfo:
+            ae.main(["--backend", "bogus"])
+        assert excinfo.value.code == 2
+        assert "invalid choice" in capsys.readouterr().err
 
 
 class TestEnsureBenchmarkClip:
@@ -914,14 +983,66 @@ class TestIndexClip:
             "end_time": 30.0,
         }])
         monkeypatch.setattr(ae, "preprocess_chunk", lambda p: p)
+        # The shared retry loop backs off between attempts; skip the waits.
+        monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+
+        attempts = []
 
         class BoomEmbedder:
             def embed_video_chunk(self, path, verbose=False):
+                attempts.append(path)
                 raise RuntimeError("embed failed")
 
         store = store_mod.SentryStore(db_path=tmp_path / "db")
         with pytest.raises(RuntimeError, match="embed failed"):
             ae.index_clip(store, clip, BoomEmbedder())
+        # Every attempt failed, so index_clip raised instead of storing a
+        # partial index — and the temp chunk dir is still cleaned up.
+        assert len(attempts) == 3
+        assert not chunk_dir.exists()
+
+    def test_transient_embed_failure_is_retried(self, ae, tmp_path,
+                                                 monkeypatch):
+        import sentrysearch.store as store_mod
+
+        clip = tmp_path / "clip.mp4"
+        clip.write_bytes(b"fake")
+        chunk_dir = tmp_path / "chunks"
+        chunk_dir.mkdir()
+        (chunk_dir / "chunk_000.mp4").write_bytes(b"chunk")
+
+        monkeypatch.setattr(ae, "chunk_video", lambda path: [{
+            "chunk_path": str(chunk_dir / "chunk_000.mp4"),
+            "source_file": str(clip),
+            "start_time": 0.0,
+            "end_time": 30.0,
+        }])
+        monkeypatch.setattr(ae, "preprocess_chunk", lambda p: p)
+        sleeps = []
+        monkeypatch.setattr(time, "sleep", sleeps.append)
+
+        vec = [math.sin(i * 0.1) for i in range(3)]
+        norm = math.sqrt(sum(x * x for x in vec))
+        vec = [x / norm for x in vec]
+
+        calls = []
+
+        class FlakyEmbedder:
+            def embed_video_chunk(self, path, verbose=False):
+                calls.append(path)
+                if len(calls) == 1:
+                    raise RuntimeError("429 rate limited")
+                return vec
+
+        store = store_mod.SentryStore(db_path=tmp_path / "db")
+        err = io.StringIO()
+        stored = ae.index_clip(store, clip, FlakyEmbedder(), err=err)
+
+        assert stored == 1
+        assert len(calls) == 2
+        assert sleeps == [2]
+        assert "attempt 1/3" in err.getvalue()
+        assert store.get_stats()["total_chunks"] == 1
         assert not chunk_dir.exists()
 
 
@@ -952,3 +1073,38 @@ class TestMainEntryPoint:
     def test_clean_run_exits_0(self, ae, monkeypatch):
         monkeypatch.setattr(ae, "run_evaluation", lambda **_kwargs: None)
         assert ae.main([]) == 0
+
+    def test_backend_config_error_exits_1_without_traceback(
+        self, ae, monkeypatch, capsys,
+    ):
+        """A backend setup failure is a user-facing error, not a crash."""
+        from sentrysearch.litellm_embedder import LiteLLMConfigError
+
+        def raise_error(**_kwargs):
+            raise LiteLLMConfigError("The litellm package is not installed.")
+
+        monkeypatch.setattr(ae, "run_evaluation", raise_error)
+        assert ae.main(["--backend", "litellm"]) == 1
+        err = capsys.readouterr().err
+        assert "Error: The litellm package is not installed." in err
+        assert "Traceback" not in err
+
+
+class TestIssue68WorkloadImport:
+    """Issue #68 imports the fixed workload instead of redefining it."""
+
+    def test_documented_import_matches_the_module(self, ae):
+        from benchmarks.accuracy_eval import (
+            BENCHMARK_CLIP_PATH,
+            BENCHMARK_CLIP_URL,
+            FLOOR_QUERIES,
+            FINE_QUERIES,
+            WORKLOAD,
+        )
+
+        assert WORKLOAD == ae.WORKLOAD
+        assert FLOOR_QUERIES == ae.FLOOR_QUERIES
+        assert FINE_QUERIES == ae.FINE_QUERIES
+        assert BENCHMARK_CLIP_PATH == ae.BENCHMARK_CLIP_PATH
+        assert BENCHMARK_CLIP_URL == ae.BENCHMARK_CLIP_URL
+        assert WORKLOAD
